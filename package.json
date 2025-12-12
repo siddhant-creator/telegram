@@ -1,0 +1,20 @@
+{
+  "name": "telegram-pdf-rag-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot that answers questions from multiple uploaded PDFs using Gemini AI",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0",
+    "@google/generative-ai": "^0.21.0",
+    "pdf-parse": "^1.1.0",
+    "axios": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
