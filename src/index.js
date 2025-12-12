@@ -5,15 +5,14 @@ import { config } from './config.js';
 import { documentStore } from './document-store.js';
 import { processPDF } from './pdf-processor.js';
 import { generateAnswer, testGeminiConnection } from './gemini-service.js';
+import http from 'http';
 
-// Initialize Telegram Bot
 // Initialize Telegram Bot
 const bot = new TelegramBot(config.TELEGRAM_BOT_TOKEN, { polling: true });
 
 // ------------------------------------------------------------------
 // 🌍 FREE HOSTING TRICK (For Render Web Service)
 // ------------------------------------------------------------------
-import http from 'http';
 const PORT = process.env.PORT || 3000;
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -30,6 +29,16 @@ console.log('🤖 Telegram PDF RAG Bot Starting...');
 function escapeMarkdown(text) {
     if (!text) return '';
     return text.replace(/([_*\[\]()~`>#+=|{}.!-])/g, '\\$1');
+}
+
+/**
+ * 📌 Send long messages safely (Telegram max = 4096 chars)
+ */
+async function sendLongMessage(bot, chatId, text) {
+    const chunks = text.match(/[\s\S]{1,4000}/g); // split into safe chunks
+    for (const chunk of chunks) {
+        await bot.sendMessage(chatId, chunk);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -153,40 +162,31 @@ bot.on('document', async (msg) => {
     const chatId = msg.chat.id;
     const document = msg.document;
 
-    // Check if it's a PDF
     if (!document.file_name.toLowerCase().endsWith('.pdf')) {
-        await bot.sendMessage(chatId, '⚠️ Please upload PDF files only. Other formats are not supported yet.');
+        await bot.sendMessage(chatId, '⚠️ Please upload PDF files only.');
         return;
     }
 
-    // Check file size (Telegram limit is 20MB)
     const fileSizeMB = document.file_size / (1024 * 1024);
     if (fileSizeMB > 20) {
-        await bot.sendMessage(chatId, `⚠️ File too large (${fileSizeMB.toFixed(1)}MB). Maximum size is 20MB.`);
+        await bot.sendMessage(chatId, `⚠️ File too large (${fileSizeMB.toFixed(1)}MB). Max is 20MB.`);
         return;
     }
 
-    // Send processing message (plain text to avoid special char issues)
-    const processingMsg = await bot.sendMessage(chatId, `📥 Processing ${document.file_name}...\n⏳ This may take a moment for large files.`);
+    const processingMsg = await bot.sendMessage(chatId, `📥 Processing ${document.file_name}...\n⏳ Please wait.`);
 
     try {
-        // Process the PDF
         const result = await processPDF(document.file_id, document.file_name);
 
-        // Store the document
         const storeResult = documentStore.addDocument(chatId, result.fileName, result.content);
 
-        // Build success message (plain text)
         let successMsg = `✅ PDF Uploaded Successfully!\n\n`;
         successMsg += `📄 File: ${result.fileName}\n`;
-        if (result.pages) {
-            successMsg += `📊 Pages: ${result.pages}\n`;
-        }
+        if (result.pages) successMsg += `📊 Pages: ${result.pages}\n`;
         successMsg += `🔧 Method: ${result.method}\n`;
         successMsg += `📚 Total Documents: ${storeResult.totalDocuments}\n\n`;
         successMsg += `💬 Now ask me anything about your document!`;
 
-        // Update message with success (plain text)
         await bot.editMessageText(successMsg, {
             chat_id: chatId,
             message_id: processingMsg.message_id
@@ -195,9 +195,8 @@ bot.on('document', async (msg) => {
     } catch (error) {
         console.error('Error processing PDF:', error);
 
-        // Plain text error message to avoid markdown issues with filenames
         await bot.editMessageText(
-            `❌ Failed to process ${document.file_name}\n\nError: ${error.message}\n\nPlease try uploading again or try a different PDF.`,
+            `❌ Failed to process ${document.file_name}\n\nError: ${error.message}`,
             {
                 chat_id: chatId,
                 message_id: processingMsg.message_id
@@ -207,67 +206,49 @@ bot.on('document', async (msg) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// QUESTION HANDLER
+// QUESTION HANDLER (Where the long response error was happening)
 // ═══════════════════════════════════════════════════════════════
 
-/**
- * Handle text messages (questions)
- */
 bot.on('text', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
 
-    // Ignore commands
     if (text.startsWith('/')) return;
 
-    // Check if user has documents
     const docCount = documentStore.getDocumentCount(chatId);
     if (docCount === 0) {
-        await bot.sendMessage(
-            chatId,
-            '📭 No documents uploaded yet.\n\nPlease send me PDF files first, then ask your questions!',
-            {
-                reply_markup: {
-                    inline_keyboard: [[
-                        { text: '📖 How to use', callback_data: 'help' }
-                    ]]
-                }
-            }
-        );
+        await bot.sendMessage(chatId, '📭 No documents uploaded yet.\n\nSend PDFs first.');
         return;
     }
 
-    // Send typing indicator
     await bot.sendChatAction(chatId, 'typing');
 
-    // Send processing message
-    const processingMsg = await bot.sendMessage(
-        chatId,
-        `🔍 Searching across ${docCount} document(s)...`
-    );
+    const processingMsg = await bot.sendMessage(chatId, `🔍 Searching across ${docCount} document(s)...`);
 
     try {
-        // Generate answer
         const result = await generateAnswer(chatId, text);
 
-        // Format response (use plain text to avoid markdown errors)
         let response = result.answer;
-
         if (result.sources && result.sources.length > 0) {
             response += `\n\n📄 Sources: ${result.sources.join(', ')}`;
         }
 
-        // Update with answer (plain text to avoid parsing errors)
-        await bot.editMessageText(response, {
-            chat_id: chatId,
-            message_id: processingMsg.message_id
-        });
+        // 🔥 FIXED: If too long, send in chunks
+        if (response.length > 4000) {
+            await bot.deleteMessage(chatId, processingMsg.message_id);
+            await sendLongMessage(bot, chatId, response);
+        } else {
+            await bot.editMessageText(response, {
+                chat_id: chatId,
+                message_id: processingMsg.message_id
+            });
+        }
 
     } catch (error) {
         console.error('Error generating answer:', error);
 
         await bot.editMessageText(
-            `❌ Sorry, I encountered an error while processing your question.\n\nPlease try again or rephrase your question.`,
+            `❌ Error while processing your question.\nPlease try again.`,
             {
                 chat_id: chatId,
                 message_id: processingMsg.message_id
@@ -285,7 +266,6 @@ bot.on('callback_query', async (query) => {
 
     if (query.data === 'help') {
         await bot.answerCallbackQuery(query.id);
-        // Emit help command
         const helpMsg = {
             chat: { id: chatId },
             text: '/help'
@@ -306,31 +286,22 @@ async function startup() {
     if (geminiOk) {
         console.log('✅ Gemini API connected successfully');
     } else {
-        console.log('⚠️ Gemini API connection failed - bot will still run but some features may not work');
+        console.log('⚠️ Gemini API connection failed');
     }
 
     console.log('═══════════════════════════════════════════');
     console.log('🚀 Bot is now running!');
     console.log(`📱 Bot: ${config.TELEGRAM_BOT_USERNAME}`);
     console.log('═══════════════════════════════════════════');
-    console.log('📌 Instructions:');
-    console.log('   1. Open Telegram and search for the bot');
-    console.log('   2. Send /start to begin');
-    console.log('   3. Upload PDF files');
-    console.log('   4. Ask questions about your documents!');
-    console.log('═══════════════════════════════════════════');
 
-    // Send startup notification to your chat
     try {
-        await bot.sendMessage(config.TELEGRAM_CHAT_ID, '🚀 PDF RAG Bot is now online!\n\nSend /start to begin.');
-    } catch (e) {
-        // Silent fail for startup notification
-    }
+        await bot.sendMessage(config.TELEGRAM_CHAT_ID, '🚀 PDF RAG Bot is now online!');
+    } catch (e) {}
 }
 
 startup();
 
-// Handle graceful shutdown
+// Graceful shutdown
 process.on('SIGINT', () => {
     console.log('\n👋 Bot shutting down...');
     bot.stopPolling();
